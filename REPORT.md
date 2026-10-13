@@ -1,6 +1,6 @@
 # Assignment 1 Report
 
-- **Name**: Angel Benito
+- **Name**: Angel Benito Irache
 - **Student ID**: 20131
 - **Email**: abenito.ieu2022@student.ie.edu
 - **Group**: BBADBA 5A
@@ -344,7 +344,7 @@ point (zeros vs PyTorch's random initialisation), so they are about 5x to
    column itself.** 99-100% of these bookings are marked canceled, which is implausible
    for real non-refundable bookings. It is probably how some group or agency
    blocks were recorded. I measured the dependence directly by refitting
-   without `deposit_type` and its interaction (same C):
+   without `deposit_type` and its interaction (same C) :
 
    | Variant | Val ROC-AUC | Test ROC-AUC | Test ROC-AUC excl. Non Refund | Test log-loss | Test cost (EUR) |
    |---|---|---|---|---|---|
