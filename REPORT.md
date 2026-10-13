@@ -17,7 +17,7 @@ columns; 37.0% of bookings were canceled.
 **Sampling.** The brief asks for about 20k rows. I took a uniform random sample
 of 20,000 rows (`random_state=42`, script `data/make_sample.py`) and sorted it
 by arrival date. Unlike taking the most recent 20k rows (only ~5 months), this
-keeps the whole 26-month window, so seasonality and the drift between years
+keeps the whole 26-month window, so seasonality and year-on-year changes
 are still present and a temporal split is still possible. The sample matches
 the full data: 37.7% canceled (vs 37.0%), 66% City / 34% Resort (same).
 Only the sample (`data/hotels_sample.csv`, 2.9 MB) is committed.
@@ -132,12 +132,14 @@ ablation below). Lead-time buckets were the clearest loser: they throw away
 the ordering inside each bucket.
 
 **What didn't work: duplicate columns.** My first feature set also had
-`is_portugal` and `has_agent`. They were exact copies of the
-`country_grp_PRT` and `agent_grp_none` one-hots, so X'X was singular
-(smallest eigenvalue of X'X/n, intercept column included, ~1e-16, i.e. zero). scikit-learn's L-BFGS solver gave an answer anyway, but
-the two gradient-descent versions crawled along those directions and had not
-converged after thousands of epochs (max probability gap to sklearn 0.06).
-Finding it from the eigenvectors and removing the two columns fixed it.
+`is_portugal` and `has_agent`. They duplicated information already in the
+`country_grp_PRT` and `agent_grp_none` one-hots (`has_agent` is just the
+complement of the latter), so X'X was singular: its smallest eigenvalue
+(of X'X/n, intercept column included) was ~1e-16, i.e. zero. scikit-learn's
+L-BFGS solver gave an answer anyway, but the two gradient-descent versions
+crawled along those directions and had not converged after thousands of
+epochs (max probability gap to sklearn 0.06). I found the problem from the
+eigenvectors, and removing the two columns fixed it.
 
 **Leakage ablation.** Same model and C, adding the excluded post-booking
 variables back (test set):
@@ -226,24 +228,29 @@ Every gap shrinks steadily with training, which is what you expect if all
 three are heading for the same optimum. Why it is slow:
 - The gradient-descent error along each direction shrinks by a factor
   (1 - lr x h) per epoch, where h is an eigenvalue of the objective's Hessian
-  (computed at the sklearn optimum, intercept included).
-- The largest eigenvalue is 0.52. Gradient descent is stable only for
-  lr < 2/0.52 = 3.9. That is why lr = 3 works and lr = 5 oscillates.
+  (computed at the sklearn optimum, intercept included). For logistic
+  regression this Hessian is X'WX/n plus lambda on the weight coefficients
+  (not on the intercept), with W = p(1 - p) per booking.
+- The largest eigenvalue is 0.52. Near the optimum, gradient descent is
+  stable only for lr < 2/0.52 = 3.9. That is why lr = 3 works and lr = 5
+  oscillates.
 - The smallest eigenvalue is 8.4e-5, almost exactly lambda (7.2e-5): along
   that direction the data adds almost no curvature, only the L2 penalty does.
   After 10,000 epochs the error along it is still (1 - 3 x 8.4e-5)^10000 ≈ 8%
   of where it started.
 - That direction is the one-hot column `distribution_channel_Undefined`, which
-  has **one** row in train. Its eigenvalue in X'X/n is 7.1e-5, essentially
-  1/n = 1/13,910 = 7.2e-5.
+  has **one** row in train, so the data barely constrains its coefficient.
+  (In the plain X'X/n its eigenvalue is 7.1e-5, essentially
+  1/n = 1/13,910 = 7.2e-5. Lambda is also 7.2e-5 only because C = 1 makes
+  lambda = 1/n.)
 - The largest coefficient gaps sit on that column, the intercept and the
   market-segment dummies that trade off against it. They affect very few
   bookings, which is why the mean probability gap is about 6e-5.
 
 L-BFGS uses curvature information, so it is not slowed down by this. Manual
 and standard PyTorch run the same algorithm and differ only in their starting
-point (zeros vs PyTorch's random initialisation), so they are 10x closer to
-each other than to sklearn.
+point (zeros vs PyTorch's random initialisation), so they are about 5x to
+10x closer to each other than to sklearn.
 
 **How I got there (what didn't work first):**
 1. With duplicate columns (see above), the PyTorch models were 0.06 away in
@@ -279,15 +286,16 @@ each other than to sklearn.
    easy ones (99-100% canceled), and their share halves in test.
    - All bookings: ROC-AUC 0.877 (val) -> 0.813 (test), a 0.064 drop.
    - Excluding Non Refund: 0.817 -> 0.771, a 0.046 drop.
-   - So composition explains about a quarter of the drop. The rest is real
-     loss of ranking quality.
+   - So the Non Refund share explains about a quarter of the drop. The rest
+     is not explained by it: it could be a harder season, a different year or
+     other shifts in the mix (see the next paragraph).
 
    With these data I cannot separate "summer is harder to predict" from "2017
    behaves differently", because the only earlier summer is inside the
-   training set. (An earlier draft argued that retraining on train +
-   validation proved this was drift rather than lack of data. That inference
+   training set. (I first read the small gain from retraining on train +
+   validation as evidence of drift rather than lack of data. That inference
    was wrong: neither set contains summer 2017, so it cannot distinguish the
-   two, and it has been removed.)
+   two, and I dropped it.)
 
    *Next*: a rolling-origin evaluation over several years, so each season is
    evaluated out of sample at least once. A cheap fix to test is re-estimating
@@ -318,17 +326,22 @@ each other than to sklearn.
 
    Both clearly beat accepting every booking. Between the model and the rule
    the interval easily includes zero, so the honest statement is "no
-   detectable difference", not "the model is worse".
+   detectable difference", not "the model is worse". With only 15 blocks the
+   intervals are approximate, so I rely on their sign pattern and not on the
+   exact endpoints.
 
    Why the model does not win: with FP twice as expensive as FN, only
-   bookings with p > 2/3 are flagged, and at that confidence the model and
-   the rule pick largely the same bookings. The model's advantage is ranking
-   (ROC-AUC 0.81; the rule cannot rank at all) and the probabilities
-   themselves. *Next*: use the probabilities where a yes/no rule cannot help,
-   for example expected cancellations per arrival date (sum of p) to size
-   overbooking.
-4. **"Non Refund" looks like a data artefact, but the model does not hinge on
-   it.** 99-100% of these bookings are marked canceled, which is implausible
+   bookings with p > 2/3 are flagged (the model flags 340 test bookings, the
+   rule 249). The two sets overlap heavily: 222 bookings are flagged by both.
+   The 118 flagged only by the model cancel 60% of the time, just below the
+   2/3 needed for a flag to pay off at a 2:1 cost ratio, so on test they cost
+   slightly more than they save. The 27 flagged only by the rule cancel 7% of
+   the time. The model's advantage is ranking (ROC-AUC 0.81; the rule has only
+   two levels) and the probabilities themselves. *Next*: use the probabilities
+   where a yes/no rule cannot help, for example expected cancellations per
+   arrival date (sum of p) to size overbooking.
+4. **"Non Refund" looks like a data artefact; the model does not need the
+   column itself.** 99-100% of these bookings are marked canceled, which is implausible
    for real non-refundable bookings. It is probably how some group or agency
    blocks were recorded. I measured the dependence directly by refitting
    without `deposit_type` and its interaction (same C):
@@ -338,10 +351,17 @@ each other than to sklearn.
    | Final (with deposit_type) | 0.877 | 0.813 | 0.771 | 0.506 | 620,705 |
    | Without deposit_type | 0.869 | 0.809 | 0.769 | 0.517 | 626,120 |
 
-   Removing it costs only 0.004 AUC and 0.9% more cost. Other booking-time
-   features (agent, country, market segment, customer type, lead time) carry
-   almost the same information. So the artefact is not why the model and the
-   rule tie (point 3). *Next*: ask the hotel how these bookings were recorded.
+   Removing the column costs 0.004 AUC and 0.9% more cost, but test log-loss
+   rises from 0.506 to 0.517, far more than the differences between feature
+   representations on validation (at most 0.004), so the probabilities do
+   use it. Other booking-time features (agent, country, market segment,
+   customer type, lead time) probably reconstruct much of it, which I have
+   not tested. This shows the model does not need `deposit_type` itself. It
+   does not show that the artefact has no influence, because correlated
+   features can carry it. What does show signal beyond the artefact is the
+   "excl. Non Refund" column: on refundable bookings alone the model still
+   ranks at ROC-AUC 0.77. *Next*: ask the hotel how these bookings were
+   recorded.
 5. **Costs are assumptions.** FP = 2 x revenue is a guess. Revenue uses ADR
    clipped at the train 99th percentile (227.09 EUR/night) rather than the
    raw ADR. The full dataset contains a rate of 5,400 EUR/night, about 50
@@ -359,9 +379,15 @@ each other than to sklearn.
 
 ## Generative AI use disclosure
 
-I used Claude (Anthropic, via Claude Code) throughout the assignment: to
-download and explore the dataset, write the code (`data/make_sample.py`,
-`pipeline.py`, `train.py`, `app.py`), run and debug the pipeline (including
-finding the duplicate-column problem). The framing, the prediction moment, the columns to exclude,
-the split, the cost structure and the threshold were discussed with the
-assistant and decided by me, and I reviewed all the code and text.
+I used Claude (Anthropic) in two ways.
+
+**Claude Code, inside the repository.** It wrote the code
+(`data/make_sample.py`, `pipeline.py`, `train.py`, `app.py`), downloaded and
+explored the dataset, ran and debugged the pipeline (including finding the
+duplicate-column problem) and produced a first draft of this report.
+
+**Claude chat (claude.ai).** I used it to compare candidate datasets and
+business problems, to review my feature list, and the finished code. In those conversations the assistant suggested options and analyses that I then adopted: predicting at
+booking time, excluding the post-booking columns and running the leakage ablation, the comparison with the same dates of 2016, the ROC-AUC excluding Non Refund bookings, the block bootstrap, the refit without `deposit_type`, and the agreement and convergence checks.
+
+I chose the dataset, the business framing, the prediction moment, the split, the cost multipliers and the threshold from the options discussed, and I reviewed all the code and text. The figures come from running the code (the exploration and `main.py train`), not from the assistant's estimates.
